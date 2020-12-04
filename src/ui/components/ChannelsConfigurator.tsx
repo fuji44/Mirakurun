@@ -63,7 +63,8 @@ const columns: IColumn[] = [
         name: "Name",
         fieldName: "name",
         minWidth: 100,
-        maxWidth: 100
+        // maxWidth: 100,
+        isResizable: true
     },
     {
         key: "col-type",
@@ -85,6 +86,7 @@ const columns: IColumn[] = [
         fieldName: "options",
         minWidth: 200,
         // maxWidth: 400
+        isResizable: true
     },
     {
         key: "col-controls",
