@@ -25,10 +25,10 @@ if (process.platform === "linux") {
         console.warn("running in not root!");
     }
 } else if (process.platform === "freebsd") {
-    if (process.getuid() === 0) {
-        execSync(`renice -n -10 -p ${ process.pid }`);
+    if (process.getuid() !== 0 || process.env.JAIL === "YES") {
+        console.warn("running in not root user or running on Jail!");
     } else {
-        console.warn("running in not root!");
+        execSync(`renice -n -10 -p ${ process.pid }`);
     }
 }
 
