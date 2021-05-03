@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 export SERVER_CONFIG_PATH=/app-config/server.yml
 export TUNERS_CONFIG_PATH=/app-config/tuners.yml
