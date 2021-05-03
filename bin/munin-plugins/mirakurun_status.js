@@ -40,7 +40,9 @@ if (process.platform === "linux") {
         socketPath = "/usr/local/mirakurun/run/mirakurun.sock";
     }
 } else if (process.platform === "freebsd") {
-    execSync(`renice -n 19 -p ${ process.pid }`);
+    if (process.env.JAIL !== "YES") {
+        execSync(`renice -n 19 -p ${ process.pid }`);
+    }
 
     if (fs.existsSync("/usr/local/mirakurun/run/mirakurun.sock")) {
         configPath = "";
