@@ -25,10 +25,11 @@ import * as apid from "../../api";
 import status from "./status";
 import Event from "./Event";
 import ChannelItem from "./ChannelItem";
+import TSFilter from "./TSFilter";
 import Client, { ProgramsQuery } from "../client";
 
 interface User extends common.User {
-    _stream?: stream.Duplex;
+    _stream?: stream.Transform;
 }
 
 interface Status {
@@ -52,7 +53,7 @@ export default class TunerDevice extends events.EventEmitter {
     private _process: child_process.ChildProcess = null;
     private _stream: stream.Readable = null;
 
-    private _users: User[] = [];
+    private _users: Set<User> = new Set();
 
     private _isAvailable: boolean = true;
     private _isRemote: boolean = false;
@@ -64,7 +65,7 @@ export default class TunerDevice extends events.EventEmitter {
     constructor(private _index: number, private _config: config.Tuner) {
         super();
         this._isRemote = !!this._config.remoteMirakurunHost;
-        Event.emit("tuner", "create", this.export());
+        Event.emit("tuner", "create", this.toJSON());
         log.debug("TunerDevice#%d initialized", this._index);
     }
 
@@ -89,11 +90,15 @@ export default class TunerDevice extends events.EventEmitter {
     }
 
     get users(): User[] {
-        return this._users.map(user => {
+        return [...this._users].map(user => {
             return {
                 id: user.id,
                 priority: user.priority,
-                agent: user.agent
+                agent: user.agent,
+                url: user.url,
+                disableDecoder: user.disableDecoder,
+                streamSetting: user.streamSetting,
+                streamInfo: user.streamInfo
             };
         });
     }
@@ -111,11 +116,11 @@ export default class TunerDevice extends events.EventEmitter {
     }
 
     get isFree(): boolean {
-        return this._isAvailable === true && this._channel === null && this._users.length === 0;
+        return this._isAvailable === true && this._channel === null && this._users.size === 0;
     }
 
     get isUsing(): boolean {
-        return this._isAvailable === true && this._channel !== null && this._users.length !== 0;
+        return this._isAvailable === true && this._channel !== null && this._users.size !== 0;
     }
 
     get isFault(): boolean {
@@ -135,7 +140,7 @@ export default class TunerDevice extends events.EventEmitter {
         return priority;
     }
 
-    export(): Status {
+    toJSON(): Status {
         return {
             index: this._index,
             name: this._config.name,
@@ -155,7 +160,7 @@ export default class TunerDevice extends events.EventEmitter {
         await this._kill(true);
     }
 
-    async startStream(user: User, stream: stream.Duplex, channel?: ChannelItem): Promise<void> {
+    async startStream(user: User, stream: TSFilter, channel?: ChannelItem): Promise<void> {
 
         log.debug("TunerDevice#%d start stream for user `%s` (priority=%d)...", this._index, user.id, user.priority);
 
@@ -168,7 +173,7 @@ export default class TunerDevice extends events.EventEmitter {
         }
 
         if (channel) {
-            if (this._config.types.indexOf(channel.type) === -1) {
+            if (this._config.types.includes(channel.type) === false) {
                 throw new Error(util.format("TunerDevice#%d is not supported for channel type `%s`", this._index, channel.type));
             }
 
@@ -189,7 +194,7 @@ export default class TunerDevice extends events.EventEmitter {
         log.info("TunerDevice#%d streaming to user `%s` (priority=%d)", this._index, user.id, user.priority);
 
         user._stream = stream;
-        this._users.push(user);
+        this._users.add(user);
         stream.once("close", () => this.endStream(user));
 
         this._updated();
@@ -199,20 +204,12 @@ export default class TunerDevice extends events.EventEmitter {
 
         log.debug("TunerDevice#%d end stream for user `%s` (priority=%d)...", this._index, user.id, user.priority);
 
-        {
-            const l = this._users.length;
-            for (let i = 0; i < l; i++) {
-                if (this._users[i].id === user.id && this._users[i].priority === user.priority) {
-                    this._users[i]._stream.end();
-                    this._users.splice(i, 1);
-                    break;
-                }
-            }
-        }
+        user._stream.end();
+        this._users.delete(user);
 
-        if (this._users.length === 0) {
+        if (this._users.size === 0) {
             setTimeout(() => {
-                if (this._users.length === 0 && this._process) {
+                if (this._users.size === 0 && this._process) {
                     this._kill(true).catch(log.error);
                 }
             }, 3000);
@@ -268,14 +265,23 @@ export default class TunerDevice extends events.EventEmitter {
 
         cmd = cmd.replace("<channel>", ch.channel);
 
-        if (ch.satelite) {
-            cmd = cmd.replace("<satelite>", ch.satelite);
+        if (ch.satellite) {
+            cmd = cmd.replace("<satelite>", ch.satellite); // deprecated
+            cmd = cmd.replace("<satellite>", ch.satellite);
         }
 
         if (ch.space) {
             cmd = cmd.replace("<space>", ch.space.toString(10));
         } else {
             cmd = cmd.replace("<space>", "0"); // set default value to '0'
+        }
+
+        if (ch.freq !== undefined) {
+            cmd = cmd.replace("<freq>", ch.freq.toString(10));
+        }
+
+        if (ch.polarity) {
+            cmd = cmd.replace("<polarity>", ch.polarity);
         }
 
         this._process = child_process.spawn(cmd.split(" ")[0], cmd.split(" ").slice(1));
@@ -352,8 +358,8 @@ export default class TunerDevice extends events.EventEmitter {
 
     private _streamOnData(chunk: Buffer): void {
 
-        for (let i = 0; i < this._users.length; i++) {
-            this._users[i]._stream.write(chunk);
+        for (const user of this._users) {
+            user._stream.write(chunk);
         }
     }
 
@@ -367,7 +373,7 @@ export default class TunerDevice extends events.EventEmitter {
             for (const user of this._users) {
                 user._stream.end();
             }
-            this._users = [];
+            this._users.clear();
         }
 
         this._updated();
@@ -429,7 +435,7 @@ export default class TunerDevice extends events.EventEmitter {
 
         if (this._closing === true) {
             this._channel = null;
-            this._users = [];
+            this._users.clear();
         }
 
         if (this._isFault === false) {
@@ -441,12 +447,12 @@ export default class TunerDevice extends events.EventEmitter {
 
         this.emit("release");
 
-        log.debug("TunerDevice#%d released", this._index);
+        log.info("TunerDevice#%d released", this._index);
 
         this._updated();
 
-        if (this._closing === false && this._users.length !== 0) {
-            log.debug("TunerDevice#%d respawning because request has not closed", this._index);
+        if (this._closing === false && this._users.size !== 0) {
+            log.warn("TunerDevice#%d respawning because request has not closed", this._index);
             ++status.errorCount.tunerDeviceRespawn;
 
             this._spawn(this._channel);
@@ -456,6 +462,6 @@ export default class TunerDevice extends events.EventEmitter {
     }
 
     private _updated(): void {
-        Event.emit("tuner", "update", this.export());
+        Event.emit("tuner", "update", this.toJSON());
     }
 }

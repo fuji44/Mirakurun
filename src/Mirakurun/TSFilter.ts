@@ -14,6 +14,7 @@
    limitations under the License.
 */
 import * as stream from "stream";
+import { StreamInfo } from "./common";
 import * as log from "./log";
 import epg from "./epg";
 import status from "./status";
@@ -23,7 +24,7 @@ import ServiceItem from "./ServiceItem";
 import * as aribts from "aribts";
 const calcCRC32: (buf: Buffer) => number = aribts.TsCrc32.calc;
 
-interface StreamOptions extends stream.DuplexOptions {
+interface StreamOptions extends stream.TransformOptions {
     readonly networkId?: number;
     readonly serviceId?: number;
     readonly eventId?: number;
@@ -66,7 +67,9 @@ interface FlagState {
     version_number: number;
 }
 
-export default class TSFilter extends stream.Duplex {
+export default class TSFilter extends stream.Transform {
+
+    streamInfo: StreamInfo = {};
 
     // options
     private _provideServiceId: number;
@@ -80,21 +83,21 @@ export default class TSFilter extends stream.Duplex {
     private _parser: stream.Transform = new aribts.TsStream();
 
     // buffer
-    private _packet: Buffer = Buffer.allocUnsafe(PACKET_SIZE);
+    private _packet: Buffer = Buffer.alloc(PACKET_SIZE);
     private _offset: number = -1;
     private _buffer: Buffer[] = [];
     private _parses: Buffer[] = [];
-    private _patsec: Buffer = Buffer.allocUnsafe(PACKET_SIZE - 4 - 1); // TS header, pointer_field
+    private _patsec: Buffer = Buffer.alloc(PACKET_SIZE - 4 - 1); // TS header, pointer_field
 
     // state
     private _closed: boolean = false;
     private _ready: boolean = true;
-    private _providePids: number[] = null; // `null` to provides all
-    private _parsePids: number[] = [];
+    private _providePids: Set<number> = null; // `null` to provides all
+    private _parsePids: Set<number> = new Set();
     private _tsid: number = -1;
-    private _patCRC: Buffer = Buffer.allocUnsafe(0);
-    private _serviceIds: number[] = [];
-    private _parseServiceIds: number[] = [];
+    private _patCRC: Buffer = Buffer.alloc(4);
+    private _serviceIds: Set<number> = new Set();
+    private _parseServiceIds: Set<number> = new Set();
     private _pmtPid: number = -1;
     private _pmtTimer: NodeJS.Timer;
     private _streamTime: number = null;
@@ -128,7 +131,7 @@ export default class TSFilter extends stream.Duplex {
         this._provideEventId = options.eventId || null;
 
         if (this._provideServiceId !== null) {
-            this._providePids = [...PROVIDE_PIDS];
+            this._providePids = new Set(PROVIDE_PIDS);
             this._ready = false;
         }
         if (this._provideEventId !== null) {
@@ -151,7 +154,7 @@ export default class TSFilter extends stream.Duplex {
         if (options.noProvide === true) {
             this._provideServiceId = null;
             this._provideEventId = null;
-            this._providePids = [];
+            this._providePids = new Set();
             this._ready = false;
         }
         if (options.parseNIT === true) {
@@ -178,28 +181,20 @@ export default class TSFilter extends stream.Duplex {
         this._parser.on("tot", this._onTOT.bind(this));
         this._parser.on("cdt", this._onCDT.bind(this));
 
-        this.once("finish", this._close.bind(this));
         this.once("close", this._close.bind(this));
 
         log.info("TSFilter has created (serviceId=%s, eventId=%s)", this._provideServiceId, this._provideEventId);
 
         if (this._ready === false) {
-            log.debug("TSFilter is waiting for serviceId=%s, eventId=%s", this._provideServiceId, this._provideEventId);
+            log.info("TSFilter is waiting for serviceId=%s, eventId=%s", this._provideServiceId, this._provideEventId);
         }
 
         ++status.streamCount.tsFilter;
     }
 
-    _read(size: number) {
+    _transform(chunk: Buffer, encoding: string, callback: Function) {
 
-        if (this._closed === true) {
-            this.push(null);
-        }
-    }
-
-    _write(chunk: Buffer, encoding: string, callback: Function) {
-
-        if (this._closed === true) {
+        if (this._closed) {
             callback(new Error("TSFilter has closed already"));
             return;
         }
@@ -268,13 +263,12 @@ export default class TSFilter extends stream.Duplex {
         }
 
         if (this._buffer.length !== 0) {
-            if (this._ready === true) {
-                this.push(Buffer.concat(this._buffer));
-                this._buffer = [];
+            if (this._ready) {
+                this.push(Buffer.concat(this._buffer.splice(0, 16732))); // { let bytes = 1024 * 1024 * 3; (bytes - bytes % 188) / 188; }
             } else {
-                this._buffer = [Buffer.concat(this._buffer)];
-                if (this._buffer[0].length > this._maxBufferBytesBeforeReady) {
-                    this._buffer[0] = this._buffer[0].slice(this._buffer[0].length - this._maxBufferBytesBeforeReady);
+                const head = this._buffer.length - (this._maxBufferBytesBeforeReady / PACKET_SIZE);
+                if (head > 0) {
+                    this._buffer.splice(0, head);
                 }
             }
         }
@@ -296,16 +290,26 @@ export default class TSFilter extends stream.Duplex {
             return;
         }
 
+        // transport_error_indicator
+        if ((packet[1] & 0x80) >> 7 === 1) {
+            if (this.streamInfo[pid]) {
+                ++this.streamInfo[pid].drop;
+            }
+            return;
+        }
+
         packet = Buffer.from(packet);
 
         // parse
-        if (pid === 0 && this._patCRC.compare(packet.slice(packet[7] + 4, packet[7] + 8))) {
-            this._patCRC = Buffer.from(packet.slice(packet[7] + 4, packet[7] + 8));
-            this._parses.push(packet);
+        if (pid === 0) {
+            if (this._patCRC.compare(packet, packet[7] + 4, packet[7] + 8) !== 0) {
+                packet.copy(this._patCRC, 0, packet[7] + 4, packet[7] + 8);
+                this._parses.push(packet);
+            }
         } else if (
-            ((pid === 0x12 || pid === 0x29) && (this._parseEIT === true || this._provideEventId !== null)) ||
+            ((pid === 0x12 || pid === 0x29) && (this._parseEIT || this._provideEventId !== null)) ||
             pid === 0x14 ||
-            this._parsePids.indexOf(pid) !== -1
+            this._parsePids.has(pid)
         ) {
             this._parses.push(packet);
         }
@@ -313,7 +317,7 @@ export default class TSFilter extends stream.Duplex {
         if (this._ready === false && (pid === 0x12 || this._provideEventId === null)) {
             return;
         }
-        if (this._providePids !== null && this._providePids.indexOf(pid) === -1) {
+        if (this._providePids !== null && this._providePids.has(pid) === false) {
             return;
         }
 
@@ -322,14 +326,23 @@ export default class TSFilter extends stream.Duplex {
             this._patsec.copy(packet, 5, 0);
         }
 
+        // packet counter
+        if (!this.streamInfo[pid]) {
+            this.streamInfo[pid] = {
+                packet: 0,
+                drop: 0
+            };
+        }
+        ++this.streamInfo[pid].packet;
+
         this._buffer.push(packet);
     }
 
     private _onPAT(pid: number, data: any): void {
 
         this._tsid = data.transport_stream_id;
-        this._serviceIds = [];
-        this._parseServiceIds = [];
+        this._serviceIds = new Set();
+        this._parseServiceIds = new Set();
 
         const l = data.programs.length;
         for (let i = 0; i < l; i++) {
@@ -341,15 +354,15 @@ export default class TSFilter extends stream.Duplex {
 
                 log.debug("TSFilter detected NIT PID=%d", NIT_PID);
 
-                if (this._parseNIT === true) {
-                    if (this._parsePids.indexOf(NIT_PID) === -1) {
-                        this._parsePids.push(NIT_PID);
+                if (this._parseNIT) {
+                    if (this._parsePids.has(NIT_PID) === false) {
+                        this._parsePids.add(NIT_PID);
                     }
                 }
                 continue;
             }
 
-            this._serviceIds.push(id);
+            this._serviceIds.add(id);
             if (this._targetNetworkId === null) {
                 item = null;
             } else {
@@ -366,11 +379,11 @@ export default class TSFilter extends stream.Duplex {
                 if (this._pmtPid !== data.programs[i].program_map_PID) {
                     this._pmtPid = data.programs[i].program_map_PID;
 
-                    if (this._providePids.indexOf(this._pmtPid) === -1) {
-                        this._providePids.push(this._pmtPid);
+                    if (this._providePids.has(this._pmtPid) === false) {
+                        this._providePids.add(this._pmtPid);
                     }
-                    if (this._parsePids.indexOf(this._pmtPid) === -1) {
-                        this._parsePids.push(this._pmtPid);
+                    if (this._parsePids.has(this._pmtPid) === false) {
+                        this._parsePids.add(this._pmtPid);
                     }
 
                     // edit PAT section
@@ -401,10 +414,10 @@ export default class TSFilter extends stream.Duplex {
                 }
             }
 
-            if (this._parseEIT === true && item) {
+            if (this._parseEIT && item) {
                 _.service.findByNetworkId(this._targetNetworkId).forEach(service => {
-                    if (this._parseServiceIds.indexOf(service.serviceId) === -1) {
-                        this._parseServiceIds.push(service.serviceId);
+                    if (this._parseServiceIds.has(service.serviceId) === false) {
+                        this._parseServiceIds.add(service.serviceId);
 
                         log.debug("TSFilter parsing serviceId=%d (%s)", service.serviceId, service.name);
                     }
@@ -412,9 +425,9 @@ export default class TSFilter extends stream.Duplex {
             }
         }
 
-        if (this._parseSDT === true) {
-            if (this._parsePids.indexOf(0x11) === -1) {
-                this._parsePids.push(0x11);
+        if (this._parseSDT) {
+            if (this._parsePids.has(0x11) === false) {
+                this._parsePids.add(0x11);
             }
         }
     }
@@ -428,29 +441,27 @@ export default class TSFilter extends stream.Duplex {
         }
 
         if (data.program_info[0]) {
-            if (this._providePids.indexOf(data.program_info[0].CA_PID) === -1) {
-                this._providePids.push(data.program_info[0].CA_PID);
+            if (this._providePids.has(data.program_info[0].CA_PID) === false) {
+                this._providePids.add(data.program_info[0].CA_PID);
             }
         }
 
-        if (this._providePids.indexOf(data.PCR_PID) === -1) {
-            this._providePids.push(data.PCR_PID);
+        if (this._providePids.has(data.PCR_PID) === false) {
+            this._providePids.add(data.PCR_PID);
         }
 
         const l = data.streams.length;
         for (let i = 0; i < l; i++) {
-            if (this._providePids.indexOf(data.streams[i].elementary_PID) === -1) {
-                this._providePids.push(data.streams[i].elementary_PID);
+            if (this._providePids.has(data.streams[i].elementary_PID) === false) {
+                this._providePids.add(data.streams[i].elementary_PID);
             }
         }
 
         // sleep
-        const index = this._parsePids.indexOf(pid);
-        if (index !== -1) {
-            this._parsePids.splice(index, 1);
-
+        if (this._parsePids.has(pid)) {
+            this._parsePids.delete(pid);
             this._pmtTimer = setTimeout(() => {
-                this._parsePids.push(pid);
+                this._parsePids.add(pid);
             }, 1000);
         }
     }
@@ -478,9 +489,8 @@ export default class TSFilter extends stream.Duplex {
 
         this.emit("network", _network);
 
-        const index = this._parsePids.indexOf(pid);
-        if (index !== -1) {
-            this._parsePids.splice(index, 1);
+        if (this._parsePids.has(pid)) {
+            this._parsePids.delete(pid);
         }
     }
 
@@ -496,7 +506,7 @@ export default class TSFilter extends stream.Duplex {
         for (let i = 0; i < l; i++) {
             const service = data.services[i];
 
-            if (this._serviceIds.indexOf(service.service_id) === -1) {
+            if (this._serviceIds.has(service.service_id) === false) {
                 continue;
             }
 
@@ -533,9 +543,8 @@ export default class TSFilter extends stream.Duplex {
 
         this.emit("services", _services);
 
-        const index = this._parsePids.indexOf(pid);
-        if (index !== -1) {
-            this._parsePids.splice(index, 1);
+        if (this._parsePids.has(pid)) {
+            this._parsePids.delete(pid);
         }
     }
 
@@ -543,6 +552,7 @@ export default class TSFilter extends stream.Duplex {
 
         // detect current event
         if (
+            this._pmtPid !== -1 &&
             data.events.length !== 0 &&
             this._provideEventId !== null && data.table_id === 0x4E && data.section_number === 0 &&
             this._provideServiceId === data.service_id
@@ -556,7 +566,7 @@ export default class TSFilter extends stream.Duplex {
                     log.info("TSFilter is now ready for eventId=%d", this._provideEventId);
                 }
             } else {
-                if (this._ready === true) {
+                if (this._ready) {
                     log.info("TSFilter is closing because eventId=%d has ended...", this._provideEventId);
 
                     const eventId = this._provideEventId;
@@ -572,8 +582,8 @@ export default class TSFilter extends stream.Duplex {
 
         // write EPG stream and store result
         if (
-            this._parseEIT === true &&
-            this._parseServiceIds.indexOf(data.service_id) !== -1 &&
+            this._parseEIT &&
+            this._parseServiceIds.has(data.service_id) &&
             data.table_id !== 0x4E && data.table_id !== 0x4F
         ) {
             epg.write(data);
@@ -631,11 +641,11 @@ export default class TSFilter extends stream.Duplex {
         const serviceId = data.service_id;
         const versionNumber = data.version_number;
 
-        if (this._epgState[networkId] === undefined) {
+        if (!this._epgState[networkId]) {
             this._epgState[networkId] = {};
         }
 
-        if (this._epgState[networkId][serviceId] === undefined) {
+        if (!this._epgState[networkId][serviceId]) {
             this._epgState[networkId][serviceId] = {
                 basic: {
                     flags: [],
@@ -728,7 +738,7 @@ export default class TSFilter extends stream.Duplex {
 
     private _close(): void {
 
-        if (this._closed === true) {
+        if (this._closed) {
             return;
         }
         this._closed = true;
@@ -754,20 +764,21 @@ export default class TSFilter extends stream.Duplex {
         this._parser.end();
         this._parser = null;
 
+        // clear streamInfo
+        this.streamInfo = null;
+
         // update status
-        if (this._parseEIT === true && this._targetNetworkId !== null) {
+        if (this._parseEIT && this._targetNetworkId !== null) {
             status.epg[this._targetNetworkId] = false;
         }
 
-        // close
-        process.nextTick(() => {
-            this.emit("close");
-            this.emit("end");
-        });
+        --status.streamCount.tsFilter;
 
         log.info("TSFilter has closed (serviceId=%s, eventId=%s)", this._provideServiceId, this._provideEventId);
 
-        --status.streamCount.tsFilter;
+        // close
+        this.emit("close");
+        this.emit("end");
     }
 }
 

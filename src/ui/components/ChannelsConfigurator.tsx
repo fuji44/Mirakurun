@@ -115,6 +115,7 @@ const Configurator: React.FC<{ uiState: UIState, uiStateEvents: EventEmitter }> 
             setTimeout(() => {
                 uiStateEvents.emit("notify:restart-required");
             }, 500);
+            setSaved(false);
             return;
         }
         (async () => {
@@ -127,9 +128,6 @@ const Configurator: React.FC<{ uiState: UIState, uiStateEvents: EventEmitter }> 
                 console.error(e);
             }
         })();
-        return () => {
-            setSaved(false);
-        }
     }, [saved]);
 
     const items = [];
@@ -212,13 +210,13 @@ const Configurator: React.FC<{ uiState: UIState, uiStateEvents: EventEmitter }> 
                         />
                         <TextField
                             style={{ width: 80 }}
-                            label="Satelite:"
-                            value={ch.satelite || ""}
+                            label="Satellite:"
+                            value={ch.satellite || ""}
                             onChange={(ev, newValue) => {
                                 if (newValue === "") {
-                                    delete ch.satelite;
+                                    delete ch.satellite;
                                 } else {
-                                    ch.satelite = newValue;
+                                    ch.satellite = newValue;
                                 }
                                 setEditing([...editing]);
                             }}
@@ -236,6 +234,37 @@ const Configurator: React.FC<{ uiState: UIState, uiStateEvents: EventEmitter }> 
                                     if (space <= 65535 && space >= 0) {
                                         ch.space = space;
                                     }
+                                }
+                                setEditing([...editing]);
+                            }}
+                        />
+                        <TextField
+                            style={{ width: 60 }}
+                            label="Freq:"
+                            value={`${ch.freq || ""}`}
+                            onChange={(ev, newValue) => {
+                                if (newValue === "") {
+                                    delete ch.freq;
+                                } else if (/^[0-9\.]+$/.test(newValue)) {
+                                    const freq = parseFloat(newValue);
+                                    ch.freq = freq;
+                                }
+                                setEditing([...editing]);
+                            }}
+                        />
+                        <Dropdown
+                            label="Polarity:"
+                            options={[
+                                { key: "-", text: "-" },
+                                { key: "H", text: "H" },
+                                { key: "V", text: "V" }
+                            ]}
+                            selectedKey={ch.polarity || "-"}
+                            onChange={(ev, option) => {
+                                if (option.key === "-") {
+                                    delete ch.polarity;
+                                } else {
+                                    ch.polarity = option.key as any;
                                 }
                                 setEditing([...editing]);
                             }}

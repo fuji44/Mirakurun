@@ -107,13 +107,28 @@ export default class Channel {
                 return;
             }
 
-            if (channel.satelite && typeof channel.satelite !== "string") {
-                log.error("invalid type of property `satelite` in channel#%d (%s) configuration", i, channel.name);
+            if (channel.satelite && !channel.satellite) {
+                log.warn("renaming deprecated property name `satelite` to `satellite` in channel#%d (%s) configuration", i, channel.name);
+                (<any> channel).satellite = channel.satelite;
+            }
+
+            if (channel.satellite && typeof channel.satellite !== "string") {
+                log.error("invalid type of property `satellite` in channel#%d (%s) configuration", i, channel.name);
                 return;
             }
 
             if (channel.space && typeof channel.space !== "number") {
                 log.error("invalid type of property `space` in channel#%d (%s) configuration", i, channel.name);
+                return;
+            }
+
+            if (channel.freq !== undefined && typeof channel.freq !== "number") {
+                log.error("invalid type of property `freq` in channel#%d (%s) configuration", i, channel.name);
+                return;
+            }
+
+            if (channel.polarity && channel.polarity !== "H" && channel.polarity !== "V") {
+                log.error("invalid type of property `polarity` in channel#%d (%s) configuration", i, channel.name);
                 return;
             }
 
