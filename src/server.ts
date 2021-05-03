@@ -24,6 +24,12 @@ if (process.platform === "linux") {
     } else {
         console.warn("running in not root!");
     }
+} else if (process.platform === "freebsd") {
+    if (process.getuid() === 0) {
+        execSync(`renice -n -10 -p ${ process.pid }`);
+    } else {
+        console.warn("running in not root!");
+    }
 }
 
 process.title = "Mirakurun: Server";
